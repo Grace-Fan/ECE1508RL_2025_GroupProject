@@ -26,14 +26,58 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
             env = gym.make("intersection-v1", render_mode=render_mode)
         else:
             env = gym.make("intersection-v1")
-        # configure observation type if supported
         try:
+            # Observation configuration
             if obs_type.lower() == "kinematics":
-                env.configure({"observation": {"type": "Kinematics"}})
+                obs_cfg = {
+                    "type": "Kinematics",
+                    "vehicles_count": 15,
+                    "features": [
+                        "presence",
+                        "x",
+                        "y",
+                        "vx",
+                        "vy",
+                        "cos_h",
+                        "sin_h",
+                    ],
+                    "features_range": {
+                        "x": [-100, 100],
+                        "y": [-100, 100],
+                        "vx": [-20, 20],
+                        "vy": [-20, 20],
+                    },
+                    "absolute": True,
+                    "flatten": False,
+                    "observe_intentions": False,
+                }
             else:
-                env.configure({"observation": {"type": "Grayscale"}})
-        except Exception:
-            pass
+                # Image-based observation
+                obs_cfg = {"type": "Grayscale"}
+
+            cfg = {
+                "observation": obs_cfg,
+                "action": {
+                    "type": "DiscreteMetaAction",
+                    "longitudinal": True,
+                    "lateral": True,
+                },
+                "duration": 20,
+                "destination": "o1",
+                "initial_vehicle_count": 10,
+                "spawn_probability": 0.6,
+                "screen_width": 600,
+                "screen_height": 600,
+                "centering_position": [0.5, 0.6],
+                "scaling": 5.5 * 1.3,
+                "collision_reward": -5.0,
+                "normalize_reward": False,
+                "offroad_terminal": True,
+                "arrived_reward": 10.0,
+            }
+            env.unwrapped.configure(cfg)
+        except Exception as e:
+            print("❌ Environment configuration failed:", e)
         env = Monitor(env)
         try:
             env.reset(seed=seed + rank)
@@ -71,7 +115,7 @@ def find_latest_checkpoint(save_path: str) -> Optional[str]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--obs-type", type=str, default="kinematics", choices=["kinematics", "rgb", "grayscale"], help="Observation type to request from HighwayEnv")
-    parser.add_argument("--total-timesteps", type=int, default=10000)
+    parser.add_argument("--total-timesteps", type=int, default=100000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="models/ppo_intersection")
@@ -82,15 +126,12 @@ def main():
 
     os.makedirs(args.save_path, exist_ok=True)
 
-    # Build vectorized envs
+    # Build base vectorized envs (no wrappers yet)
     env_fns = [make_env_fn(args.obs_type, i, seed=args.seed) for i in range(args.n_envs)]
     if args.n_envs > 1:
-        vec_env = SubprocVecEnv(env_fns)
+        base_env = SubprocVecEnv(env_fns)
     else:
-        vec_env = DummyVecEnv(env_fns)
-
-    # Normalize observations (do not normalize rewards for episodic tasks)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
+        base_env = DummyVecEnv(env_fns)
 
     # Determine policy type using a single env instance
     probe_env = gym.make("intersection-v1")
@@ -105,7 +146,22 @@ def main():
     policy = choose_policy_from_env(probe_env)
     probe_env.close()
 
-    # If image observations, transpose to channel-first
+    # Build normalized env, loading stats if resuming; apply image transpose after normalization for consistency
+    vec_env = None
+    vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
+    if args.resume and os.path.exists(vecnorm_path):
+        try:
+            vec_env = VecNormalize.load(vecnorm_path, base_env)
+            vec_env.training = True
+            vec_env.norm_reward = False
+            print("Loaded VecNormalize stats for training env.")
+        except Exception:
+            print("Failed to load VecNormalize stats; creating new VecNormalize.")
+            vec_env = VecNormalize(base_env, norm_obs=True, norm_reward=False)
+    else:
+        vec_env = VecNormalize(base_env, norm_obs=True, norm_reward=False)
+
+    # If image observations, transpose to channel-first AFTER VecNormalize
     if policy == "CnnPolicy":
         try:
             vec_env = VecTransposeImage(vec_env)
@@ -115,12 +171,24 @@ def main():
     tensorboard_log = args.save_path if args.tensorboard else None
 
     # Prepare callbacks
-    checkpoint_callback = CheckpointCallback(save_freq=max(1000, args.total_timesteps // 10), save_path=args.save_path, name_prefix="ppo_checkpoint") # Save every 1000 steps or 10% of total training
+    checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=args.save_path, name_prefix="ppo_checkpoint") # Save every 10000 steps
+    
+    # Determine render mode for evaluation based on user input
+    eval_render_mode = None if args.render_mode == "none" else args.render_mode
     
     # Create and wrap eval env the same way as training env (with optional rendering)
-    eval_render = None if args.render_mode == "none" else args.render_mode
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render)())])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)  # training=False for evaluation
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode)())])
+    # Load VecNormalize stats for eval callback if available to match training normalization
+    vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
+    if os.path.exists(vecnorm_path):
+        try:
+            eval_env = VecNormalize.load(vecnorm_path, eval_env)
+            eval_env.training = False
+            eval_env.norm_reward = False
+        except Exception:
+            eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    else:
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)  # training=False for evaluation
     
     # Add image wrapper if needed
     if policy == "CnnPolicy":
@@ -129,7 +197,7 @@ def main():
         except Exception:
             pass
     
-    eval_callback = EvalCallback(eval_env, best_model_save_path=args.save_path, log_path=args.save_path, eval_freq=max(1000, args.total_timesteps // 10), n_eval_episodes=3, deterministic=True)
+    eval_callback = EvalCallback(eval_env, best_model_save_path=args.save_path, log_path=args.save_path, eval_freq=10000, n_eval_episodes=3, deterministic=True)
 
     # Use CPU for MlpPolicy (faster) and GPU for CnnPolicy (if available)
     device = 'cpu' if policy == "MlpPolicy" else 'auto'
@@ -140,16 +208,8 @@ def main():
         if latest is not None:
             print(f"Resuming from checkpoint: {latest}")
             try:
-                # load model and attach vec_env
-                model = PPO.load(latest, env=vec_env)
-                # Try to load VecNormalize statistics if saved
-                vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
-                if os.path.exists(vecnorm_path):
-                    try:
-                        VecNormalize.load(vecnorm_path, vec_env)
-                        print("Loaded VecNormalize stats.")
-                    except Exception:
-                        print("Failed to load VecNormalize stats; continuing without them.")
+                # load model and attach already-prepared vec_env
+                model = PPO.load(latest, env=vec_env, device=device)
             except Exception as e:
                 print(f"Failed to load checkpoint: {e}")
 
@@ -181,8 +241,17 @@ def main():
         pass
 
     # Final evaluation using same wrapped env setup as training (with optional rendering)
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render)())])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode)())])
+    vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
+    if os.path.exists(vecnorm_path):
+        try:
+            eval_env = VecNormalize.load(vecnorm_path, eval_env)
+            eval_env.training = False
+            eval_env.norm_reward = False
+        except Exception:
+            eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    else:
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
     
     if policy == "CnnPolicy":
         try:
@@ -194,7 +263,6 @@ def main():
     n_eval_episodes = 10
     success_count = collision_count = timeout_count = 0
     total_rewards = []
-    progress_rewards = []
     collision_penalties = []
     episode_lengths = []
 
@@ -203,7 +271,6 @@ def main():
         obs = eval_env.reset()
         done = False
         episode_reward = 0.0
-        episode_progress = 0.0
         episode_collision = 0.0
         steps = 0
 
@@ -222,8 +289,6 @@ def main():
             # Accumulate collision penalty from agents_rewards if present (negative values indicate penalty)
             if isinstance(agents_rewards, (list, tuple)) and len(agents_rewards) > 0:
                 episode_collision += sum(min(0.0, float(x)) for x in agents_rewards)
-
-            episode_progress += float(rw.get('high_speed_reward', 0.0)) + float(rw.get('on_road_reward', 0.0)) + float(rw.get('arrived_reward', 0.0))
 
             done = dones[0]
             steps += 1
@@ -252,7 +317,6 @@ def main():
             outcome = 'Timeout'
 
         total_rewards.append(episode_reward)
-        progress_rewards.append(episode_progress)
         collision_penalties.append(episode_collision)
         episode_lengths.append(steps)
 
@@ -265,7 +329,6 @@ def main():
     print(f"Timeout Rate: {timeout_count/n_eval_episodes*100:.1f}% ({timeout_count}/{n_eval_episodes} episodes)")
     print(f"\nReward Breakdown (mean ± std):")
     print(f"Total Reward: {sum(total_rewards)/len(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
-    print(f"Progress Reward: {sum(progress_rewards)/len(progress_rewards):.2f} ± {np.std(progress_rewards):.2f}")
     print(f"Collision Penalty: {sum(collision_penalties)/len(collision_penalties):.2f} ± {np.std(collision_penalties):.2f}")
     print(f"Episode Length: {sum(episode_lengths)/len(episode_lengths):.1f} ± {np.std(episode_lengths):.1f} steps")
 
