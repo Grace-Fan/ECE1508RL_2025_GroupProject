@@ -18,7 +18,11 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
     """Create a callable that builds a single `intersection-v1` env and configures it.
 
     If `render_mode` is provided, it will be passed to gym.make (useful for evaluation).
-    curriculum_level: 0=easy (2 vehicles, 0.2 spawn, 30 steps), 1=medium (6 vehicles, 0.4 spawn, 35 steps), 2=normal (10 vehicles, 0.6 spawn, 40 steps)
+    curriculum_level mapping:
+        0 = EASY    (2 vehicles,  0.2 spawn, duration 30)
+        1 = MEDIUM  (6 vehicles,  0.4 spawn, duration 35)
+        2 = TRANSIT (8 vehicles,  0.5 spawn, duration 40)
+        3 = NORMAL  (10 vehicles, 0.6 spawn, duration 40)
     """
 
     def _init():
@@ -56,7 +60,7 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
                 # Image-based observation
                 obs_cfg = {"type": "Grayscale"}
 
-            # Curriculum: easy → medium → normal
+            # Curriculum: easy -> medium -> transit -> normal
             if curriculum_level == 0:
                 duration = 30
                 initial_vehicle_count = 2
@@ -65,7 +69,11 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
                 duration = 35
                 initial_vehicle_count = 6
                 spawn_probability = 0.4
-            else:  # level 2 or higher
+            elif curriculum_level == 2:
+                duration = 40
+                initial_vehicle_count = 8
+                spawn_probability = 0.5
+            else:  # level 3 or higher
                 duration = 40
                 initial_vehicle_count = 10
                 spawn_probability = 0.6
@@ -145,11 +153,11 @@ class CurriculumCallback(BaseCallback):
         self.logger.record("curriculum/level", self.current_level)
 
         # Check if we should advance to next level
-        new_level = min(self.num_timesteps // self.steps_per_level, 2)
+        new_level = min(self.num_timesteps // self.steps_per_level, 3)
 
         if new_level > self.current_level:
             self.current_level = new_level
-            level_names = ["EASY", "MEDIUM", "NORMAL"]
+            level_names = ["EASY", "MEDIUM", "TRANSIT", "NORMAL"]
             print(f"\n[Curriculum] Advancing to {level_names[self.current_level]} (level {self.current_level}) at {self.num_timesteps} steps")
 
             # Log level transition to TensorBoard
@@ -187,14 +195,14 @@ def main():
     parser.add_argument("--tensorboard", action="store_true", help="Enable tensorboard logging")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     parser.add_argument("--render-mode", type=str, choices=["none", "human", "rgb_array"], default="none", help="Render mode for evaluation (none/human/rgb_array)")
-    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (easy->medium->normal)")
+    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (easy->medium->transit->normal)")
     parser.add_argument("--curriculum-steps", type=int, default=100000, help="Steps per curriculum level")
     args = parser.parse_args()
 
     os.makedirs(args.save_path, exist_ok=True)
 
     # Determine initial curriculum level
-    initial_curriculum_level = 0 if args.curriculum else 2  # Start easy if curriculum enabled, else normal
+    initial_curriculum_level = 0 if args.curriculum else 3  # Start easy if curriculum enabled, else normal (3)
 
     # Build base vectorized envs (no wrappers yet)
     env_fns = [make_env_fn(args.obs_type, i, seed=args.seed, curriculum_level=initial_curriculum_level) for i in range(args.n_envs)]
@@ -255,14 +263,14 @@ def main():
             verbose=1
         )
         callbacks.append(curriculum_callback)
-        print(f"Curriculum learning enabled: {args.curriculum_steps} steps per level (easy->medium->normal)")
+    print(f"Curriculum learning enabled: {args.curriculum_steps} steps per level (easy->medium->transit->normal)")
 
     # Determine render mode for evaluation based on user input
     eval_render_mode = None if args.render_mode == "none" else args.render_mode
 
     # Create and wrap eval env the same way as training env (with optional rendering)
-    # Always use normal difficulty (level 2) for evaluation
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=2)())])
+    # Always use normal difficulty (level 3) for evaluation
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
     # Load VecNormalize stats for eval callback if available to match training normalization
     vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
     if os.path.exists(vecnorm_path):
@@ -303,10 +311,11 @@ def main():
         model = PPO(
             policy,
             vec_env,
-            n_steps=2048,        # Collect 2048 steps per update
-            batch_size=64,       # 64 steps per minibatch
-            n_epochs=10,         # Number of updates on the same batch
+            n_steps=1024,        # Collect 1024 steps per update
+            batch_size=128,      # 128 steps per minibatch
+            n_epochs=20,         # Number of updates on the same batch
             learning_rate=3e-4,
+            ent_coef=0.02,
             gamma=0.99,          # Discount factor for long-term planning
             verbose=1,
             seed=args.seed,
@@ -327,8 +336,8 @@ def main():
         pass
 
     # Final evaluation using same wrapped env setup as training (with optional rendering)
-    # Use normal difficulty (level 2) for final evaluation
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=2)())])
+    # Use normal difficulty (level 3) for final evaluation
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
     vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
     if os.path.exists(vecnorm_path):
         try:
