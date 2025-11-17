@@ -1,4 +1,5 @@
 import argparse
+import os
 import json
 import math
 import random
@@ -7,9 +8,16 @@ from typing import Dict, List, Tuple
 import numpy as np
 import gymnasium as gym
 import highway_env
+try:
+    from gymnasium.wrappers import RecordVideo
+except Exception:  # Fallback for older gymnasium versions
+    try:
+        from gym.wrappers import RecordVideo
+    except Exception:
+        RecordVideo = None
 
 
-IDLE, LANE_LEFT, LANE_RIGHT, FASTER, SLOWER = 0, 1, 2, 3, 4
+LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER = 0, 1, 2, 3, 4
 
 
 @dataclass
@@ -160,8 +168,9 @@ class RuleBasedIntersectionAgent:
         return ego, others
 
 
-def make_env(render: bool = False, seed: int = 0):
-    render_mode = "human" if render else None
+def make_env(render: bool = False, seed: int = 0, video: bool = False):
+    # Use rgb_array when recording video to capture frames
+    render_mode = "rgb_array" if video else ("human" if render else None)
     env = gym.make(
         "intersection-v1",
         render_mode=render_mode,
@@ -173,7 +182,7 @@ def make_env(render: bool = False, seed: int = 0):
                 "observation": {
                     "type": "Kinematics",
                     "features": ["presence", "x", "y", "vx", "vy", "heading"],
-                    "vehicles_count": 15,
+                    "vehicles_count": 10,
                 },
                 "action": {
                     "type": "DiscreteMetaAction",
@@ -251,10 +260,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Rule-based baseline for highway_env intersection-v1"
     )
-    parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
+    parser.add_argument("--episodes", type=int, default=100, help="Number of evaluation episodes")
     parser.add_argument("--render", type=int, default=0, help="Render the environment (1=yes, 0=no)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--out", type=str, default="", help="Optional path to save JSON metrics")
+    parser.add_argument("--save-video", type=int, default=0, help="Save episode videos (1=yes, 0=no)")
+    parser.add_argument("--video-dir", type=str, default="videos", help="Directory to save videos")
 
     args = parser.parse_args()
 
@@ -264,7 +275,26 @@ def main():
     cfg = AgentConfig()
     agent = RuleBasedIntersectionAgent(cfg)
 
-    env = make_env(render=bool(args.render), seed=args.seed)
+    # Prepare environment; if saving video, ensure rgb_array frames and wrap with RecordVideo
+    save_video = bool(args.save_video)
+    env = make_env(render=bool(args.render), seed=args.seed, video=save_video)
+    if save_video and RecordVideo is not None:
+        try:
+            os.makedirs(args.video_dir, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            env = RecordVideo(
+                env,
+                video_folder=args.video_dir,
+                episode_trigger=lambda ep_id: True,  # record all episodes
+                name_prefix="rule_based",
+            )
+            print(f"Video recording enabled. Saving to: {args.video_dir}")
+        except Exception as e:
+            print(f"Failed to enable video recording: {e}")
+    elif save_video and RecordVideo is None:
+        print("RecordVideo wrapper not available; cannot save videos. Update gymnasium.")
 
     try:
         stats = evaluate(agent, env, episodes=args.episodes, render=bool(args.render))
