@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 import numpy as np
 import gymnasium as gym
 import highway_env
@@ -14,7 +14,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecTransposeImage
 
 
-def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[str] = None, curriculum_level: int = 0) -> Callable[[], Any]:
+def make_env_fn(rank: int, seed: int = 0, render_mode: Optional[str] = None, curriculum_level: int = 0) -> Callable[[], Any]:
     """Create a callable that builds a single `intersection-v1` env and configures it.
 
     If `render_mode` is provided, it will be passed to gym.make (useful for evaluation).
@@ -33,32 +33,28 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
             env = gym.make("intersection-v1")
         try:
             # Observation configuration
-            if obs_type.lower() == "kinematics":
-                obs_cfg = {
-                    "type": "Kinematics",
-                    "vehicles_count": 15,
-                    "features": [
-                        "presence",
-                        "x",
-                        "y",
-                        "vx",
-                        "vy",
-                        "cos_h",
-                        "sin_h",
-                    ],
-                    "features_range": {
-                        "x": [-100, 100],
-                        "y": [-100, 100],
-                        "vx": [-20, 20],
-                        "vy": [-20, 20],
-                    },
-                    "absolute": True,
-                    "flatten": False,
-                    "observe_intentions": False,
-                }
-            else:
-                # Image-based observation
-                obs_cfg = {"type": "Grayscale"}
+            obs_cfg = {
+                "type": "Kinematics",
+                "vehicles_count": 10,
+                "features": [
+                    "presence",
+                    "x",
+                    "y",
+                    "vx",
+                    "vy",
+                    "cos_h",
+                    "sin_h",
+                ],
+                "features_range": {
+                    "x": [-100, 100],
+                    "y": [-100, 100],
+                    "vx": [-20, 20],
+                    "vy": [-20, 20],
+                },
+                "absolute": True,
+                "flatten": False,
+                "observe_intentions": False,
+            }
 
             # Curriculum: easy -> medium -> transit -> normal
             if curriculum_level == 0:
@@ -83,7 +79,7 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
                 "action": {
                     "type": "DiscreteMetaAction",
                     "longitudinal": True,
-                    "lateral": True,
+                    "lateral": False,
                 },
                 "duration": duration,
                 "destination": "o1",
@@ -93,14 +89,19 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
                 "screen_height": 600,
                 "centering_position": [0.5, 0.6],
                 "scaling": 5.5 * 1.3,
-                "collision_reward": -5.0,
+                # "collision_reward": -5.0,
                 "normalize_reward": False,
                 "offroad_terminal": True,
-                "arrived_reward": 10.0,
+                # "arrived_reward": 1.0,
+                # "high_speed_reward": 0,
             }
             env.unwrapped.configure(cfg)
         except Exception as e:
             print("Env Configuration failed:", e)
+        # Ensure collision penalty surfaces in scalar reward when missing
+        env = CollisionAugmentWrapper(env)
+        # Encourage waiting until intersection is safe before turning
+        # env = SafeTurnRewardWrapper(env, danger_radius=12.0, penalty=-0.2)
         env = Monitor(env)
         try:
             env.reset(seed=seed + rank)
@@ -114,17 +115,6 @@ def make_env_fn(obs_type: str, rank: int, seed: int = 0, render_mode: Optional[s
     return _init
 
 
-def choose_policy_from_env(env) -> str:
-    """Return 'CnnPolicy' if observation looks like an image, else 'MlpPolicy'."""
-    try:
-        shape = env.observation_space.shape
-        if shape is not None and len(shape) == 3:
-            return "CnnPolicy"
-    except Exception:
-        pass
-    return "MlpPolicy"
-
-
 def find_latest_checkpoint(save_path: str) -> Optional[str]:
     """Return the latest checkpoint file path (ppo_checkpoint_*.zip) or None."""
     pattern = os.path.join(save_path, "ppo_checkpoint_*.zip")
@@ -135,15 +125,148 @@ def find_latest_checkpoint(save_path: str) -> Optional[str]:
     return files[-1]
 
 
+class CollisionAugmentWrapper(gym.Wrapper):
+    """Inject collision penalty into scalar reward when env reports crash but reward is non-negative.
+
+    Uses env.unwrapped.config['collision_reward'] (fallback -30.0) and tags info['injected_collision_penalty'].
+    """
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        try:
+            rw = info.get('rewards', {}) if isinstance(info.get('rewards', {}), dict) else {}
+            crashed = info.get('crashed', False) or bool(rw.get('collision_reward'))
+            if crashed and float(reward) >= 0.0:
+                collision_val = float(getattr(self.env.unwrapped, 'config', {}).get('collision_reward', -5.0))
+                reward = collision_val
+        except Exception:
+            print("CollisionAugmentWrapper: Exception during step reward adjustment.")
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+
+class SafeTurnRewardWrapper(gym.Wrapper):
+    """Reward shaping wrapper to encourage "wait until safe, then go".
+
+    Adds a small negative reward each step the ego is inside the intersection
+    region and another vehicle is within a given danger radius. This discourages
+    entering or lingering in a busy intersection and encourages waiting until it
+    is actually safe.
+    """
+
+    def __init__(self, env, danger_radius: float = 8.0, penalty: float = -0.1):
+        super().__init__(env)
+        self.danger_radius = danger_radius
+        self.penalty = penalty
+
+        # # Small bonus for waiting safely when blocked by other vehicles
+        # self.safe_wait_bonus = 0.1
+
+        # Intersection region in world coordinates (tune if needed).
+        self.intersection_x_min = -15.0
+        self.intersection_x_max = 15.0
+        self.intersection_y_min = -15.0
+        self.intersection_y_max = 15.0
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        try:
+            # Kinematics observation: (vehicles, features) with
+            # [presence, x, y, vx, vy, cos_h, sin_h]
+            if isinstance(obs, np.ndarray) and obs.ndim == 1:
+                feat_dim = 7
+                vehicles_count = obs.shape[0] // feat_dim
+                obs_2d = obs.reshape(vehicles_count, feat_dim)
+            else:
+                obs_2d = obs
+
+            ego = obs_2d[0]
+            ego_x, ego_y = float(ego[1]), float(ego[2])
+            ego_vx, ego_vy = float(ego[3]), float(ego[4])
+            ego_speed = float(np.hypot(ego_vx, ego_vy))
+
+            # --- Lead-vehicle proximity penalty (rear-end avoidance) ---
+            # Penalize when another vehicle is directly ahead and too close,
+            # regardless of being inside the intersection. This encourages
+            # braking instead of tailgating and reduces rear-end crashes.
+            lead_too_close = False
+            for v in obs_2d[1:]:
+                presence = v[0]
+                if presence <= 0.0:
+                    continue
+                vx, vy = float(v[1]), float(v[2])
+                dx, dy = vx - ego_x, vy - ego_y
+                # Ahead region: in front (dx > 0), near lane center (|dy| small),
+                # and within a short headway distance.
+                if dx > 0.0 and abs(dy) < 3.0 and dx < 6.0:
+                    lead_too_close = True
+                    break
+
+            if lead_too_close:
+                # DiscreteMetaAction mapping: 0=IDLE, 1=FASTER, 2=SLOWER
+                if isinstance(action, (int, np.integer)):
+                    act_val = int(action)
+                elif isinstance(action, (list, np.ndarray)) and len(action) > 0:
+                    act_val = int(action[0])
+                else:
+                    act_val = None
+                    print("SafeTurnRewardWrapper: Unable to interpret action for lead vehicle penalty.")
+
+                if act_val in (0, 1):  # IDLE or FASTER -> penalize
+                    speed_factor = 1.0 + ego_speed / 10.0
+                    scaled_penalty = self.penalty * speed_factor
+                    reward += scaled_penalty
+                    info.setdefault("unsafe_penalties", {})
+                    info["unsafe_penalties"]["lead"] = info["unsafe_penalties"].get("lead", 0.0) + scaled_penalty
+
+                # elif act_val == 2:  # SLOWER -> reward
+                #     reward += self.safe_wait_bonus
+                #     info.setdefault("safe_wait_bonus", 0.0)
+                #     info["safe_wait_bonus"] += self.safe_wait_bonus
+
+            in_intersection = (
+                self.intersection_x_min <= ego_x <= self.intersection_x_max
+                and self.intersection_y_min <= ego_y <= self.intersection_y_max
+            )
+
+            if in_intersection:
+                min_dist = np.inf
+                for v in obs_2d[1:]:
+                    presence = v[0]
+                    if presence <= 0.0:
+                        continue
+                    vx, vy = float(v[1]), float(v[2])
+                    dist = np.hypot(vx - ego_x, vy - ego_y)
+                    if dist < min_dist:
+                        min_dist = dist
+
+                if min_dist < self.danger_radius:
+                    # Scale intersection penalty by speed as well
+                    speed_factor = 1.0 + ego_speed / 10.0
+                    scaled_penalty = self.penalty * speed_factor
+                    reward += scaled_penalty
+                    info.setdefault("unsafe_penalties", {})
+                    info["unsafe_penalties"]["intersection"] = info["unsafe_penalties"].get("intersection", 0.0) + scaled_penalty
+        except Exception:
+            print("SafeTurnRewardWrapper: Exception during step reward adjustment.")
+
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+
 class CurriculumCallback(BaseCallback):
     """Callback to gradually increase environment difficulty during training."""
 
-    def __init__(self, vec_env, n_envs: int, obs_type: str, seed: int,
+    def __init__(self, vec_env, n_envs: int, seed: int,
                  steps_per_level: int = 100000, verbose: int = 0):
         super().__init__(verbose)
         self.vec_env = vec_env
         self.n_envs = n_envs
-        self.obs_type = obs_type
         self.seed = seed
         self.steps_per_level = steps_per_level
         self.current_level = 0
@@ -164,7 +287,7 @@ class CurriculumCallback(BaseCallback):
             self.logger.record("curriculum/level_transition", self.current_level)
 
             # Recreate environments with new difficulty
-            env_fns = [make_env_fn(self.obs_type, i, seed=self.seed, curriculum_level=self.current_level)
+            env_fns = [make_env_fn(i, seed=self.seed, curriculum_level=self.current_level)
                       for i in range(self.n_envs)]
 
             # Get the base VecEnv from the wrapper stack
@@ -187,8 +310,7 @@ class CurriculumCallback(BaseCallback):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--obs-type", type=str, default="kinematics", choices=["kinematics", "rgb", "grayscale"], help="Observation type to request from HighwayEnv")
-    parser.add_argument("--total-timesteps", type=int, default=100000)
+    parser.add_argument("--total-timesteps", type=int, default=200000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="models/ppo_intersection")
@@ -196,7 +318,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     parser.add_argument("--render-mode", type=str, choices=["none", "human", "rgb_array"], default="none", help="Render mode for evaluation (none/human/rgb_array)")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (easy->medium->transit->normal)")
-    parser.add_argument("--curriculum-steps", type=int, default=100000, help="Steps per curriculum level")
+    parser.add_argument("--curriculum-steps", type=int, default=20000, help="Steps per curriculum level")
     args = parser.parse_args()
 
     os.makedirs(args.save_path, exist_ok=True)
@@ -205,24 +327,11 @@ def main():
     initial_curriculum_level = 0 if args.curriculum else 3  # Start easy if curriculum enabled, else normal (3)
 
     # Build base vectorized envs (no wrappers yet)
-    env_fns = [make_env_fn(args.obs_type, i, seed=args.seed, curriculum_level=initial_curriculum_level) for i in range(args.n_envs)]
+    env_fns = [make_env_fn(i, seed=args.seed, curriculum_level=initial_curriculum_level) for i in range(args.n_envs)]
     if args.n_envs > 1:
         base_env = SubprocVecEnv(env_fns)
     else:
         base_env = DummyVecEnv(env_fns)
-
-    # Determine policy type using a single env instance
-    probe_env = gym.make("intersection-v1")
-    try:
-        # apply same observation configuration to probe as training envs
-        if args.obs_type.lower() == "kinematics":
-            probe_env.configure({"observation": {"type": "Kinematics"}})
-        else:
-            probe_env.configure({"observation": {"type": "Grayscale"}})
-    except Exception:
-        pass
-    policy = choose_policy_from_env(probe_env)
-    probe_env.close()
 
     # Build normalized env, loading stats if resuming; apply image transpose after normalization for consistency
     vec_env = None
@@ -239,13 +348,6 @@ def main():
     else:
         vec_env = VecNormalize(base_env, norm_obs=True, norm_reward=False)
 
-    # If image observations, transpose to channel-first AFTER VecNormalize
-    if policy == "CnnPolicy":
-        try:
-            vec_env = VecTransposeImage(vec_env)
-        except Exception:
-            pass
-
     tensorboard_log = args.save_path if args.tensorboard else None
 
     # Prepare callbacks
@@ -257,7 +359,6 @@ def main():
         curriculum_callback = CurriculumCallback(
             vec_env=vec_env,
             n_envs=args.n_envs,
-            obs_type=args.obs_type,
             seed=args.seed,
             steps_per_level=args.curriculum_steps,
             verbose=1
@@ -270,7 +371,7 @@ def main():
 
     # Create and wrap eval env the same way as training env (with optional rendering)
     # Always use normal difficulty (level 3) for evaluation
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
     # Load VecNormalize stats for eval callback if available to match training normalization
     vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
     if os.path.exists(vecnorm_path):
@@ -283,18 +384,11 @@ def main():
     else:
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)  # training=False for evaluation
 
-    # Add image wrapper if needed
-    if policy == "CnnPolicy":
-        try:
-            eval_env = VecTransposeImage(eval_env)
-        except Exception:
-            pass
-
     eval_callback = EvalCallback(eval_env, best_model_save_path=args.save_path, log_path=args.save_path, eval_freq=10000, n_eval_episodes=3, deterministic=True)
     callbacks.append(eval_callback)
 
-    # Use CPU for MlpPolicy (faster) and GPU for CnnPolicy (if available)
-    device = 'cpu' if policy == "MlpPolicy" else 'auto'
+    policy = "MlpPolicy"
+    device = "cpu"
 
     model = None
     if args.resume:
@@ -319,9 +413,9 @@ def main():
             gamma=0.99,          # Discount factor for long-term planning
             verbose=1,
             seed=args.seed,
-            device=device,       # CPU for MLP, GPU for CNN
+            device=device,
             tensorboard_log=tensorboard_log,
-            policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])) if policy == "MlpPolicy" else None,
+            policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
         )
 
     # Train
@@ -337,7 +431,7 @@ def main():
 
     # Final evaluation using same wrapped env setup as training (with optional rendering)
     # Use normal difficulty (level 3) for final evaluation
-    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(args.obs_type, 0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
+    eval_env = DummyVecEnv([lambda: Monitor(make_env_fn(0, args.seed, render_mode=eval_render_mode, curriculum_level=3)())])
     vecnorm_path = os.path.join(args.save_path, "vecnormalize.pkl")
     if os.path.exists(vecnorm_path):
         try:
@@ -349,84 +443,51 @@ def main():
     else:
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
 
-    if policy == "CnnPolicy":
-        try:
-            eval_env = VecTransposeImage(eval_env)
-        except Exception:
-            pass
-
     # Run multiple evaluation episodes
-    n_eval_episodes = 10
+    n_eval_episodes = 100
     success_count = collision_count = timeout_count = 0
-    total_rewards = []
-    collision_penalties = []
-    episode_lengths = []
+    ep_rewards: List[float] = []
+    ep_lengths: List[int] = []
 
     print("\nRunning evaluation episodes ...")
     for episode in range(n_eval_episodes):
         obs = eval_env.reset()
         done = False
-        episode_reward = 0.0
-        episode_collision = 0.0
+        ep_reward = 0.0
         steps = 0
+        last_info = {}
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, rewards, dones, infos = eval_env.step(action)
-            reward = float(rewards[0])
-            info = infos[0]
-
-            episode_reward += reward
-            # Expect info['rewards'] to be a dict with keys: collision_reward, high_speed_reward, arrived_reward, on_road_reward
-            rw = info.get('rewards', {}) if isinstance(info.get('rewards', {}), dict) else {}
-            # `rw['collision_reward']` is a per-objective flag (True/1.0) when a collision happened.
-            # The actual scalar penalty applied per agent is available in `info['agents_rewards']` (can be negative).
-            agents_rewards = info.get('agents_rewards', ())
-            # Accumulate collision penalty from agents_rewards if present (negative values indicate penalty)
-            if isinstance(agents_rewards, (list, tuple)) and len(agents_rewards) > 0:
-                episode_collision += sum(min(0.0, float(x)) for x in agents_rewards)
-
-            done = dones[0]
+            print(f"Episode {episode}, step {steps}: action = {action[0]}")
+            obs, reward, done, info = eval_env.step(action)
+            ep_reward += float(reward[0])
             steps += 1
+            last_info = info[0]
             try:
                 eval_env.render()
             except Exception:
                 pass
 
-        rw = info.get('rewards', {}) if isinstance(info.get('rewards', {}), dict) else {}
-        agents_rewards = info.get('agents_rewards', ())
+        ep_rewards.append(ep_reward)
+        ep_lengths.append(steps)
 
-        # Collision if explicit crashed flag OR per-objective collision flag (rw['collision_reward']) is truthy
-        collision_flag = info.get('crashed', False) or bool(rw.get('collision_reward'))
+        rw = last_info.get('rewards', {}) if isinstance(last_info.get('rewards', {}), dict) else {}
+        crashed = bool(last_info.get("crashed", False))
+        arrived = bool(float(rw.get('arrived_reward', 0.0)) > 0.0)
 
-        if collision_flag:
-            collision_count += 1
-            outcome = 'Collision'
-        elif float(rw.get('arrived_reward', 0.0)) > 0.0:
+        if arrived:
             success_count += 1
-            outcome = 'Success'
-        elif info.get('TimeLimit.truncated', False):
-            timeout_count += 1
-            outcome = 'Timeout'
+        elif crashed:
+            collision_count += 1
         else:
             timeout_count += 1
-            outcome = 'Timeout'
-
-        total_rewards.append(episode_reward)
-        collision_penalties.append(episode_collision)
-        episode_lengths.append(steps)
-
-        print(f"Episode {episode+1}/{n_eval_episodes}: Reward={episode_reward:.2f}, Length={steps}, {outcome}")
 
     # Print evaluation statistics
     print("\nEvaluation Results:")
     print(f"Success Rate: {success_count/n_eval_episodes*100:.1f}% ({success_count}/{n_eval_episodes} episodes)")
     print(f"Collision Rate: {collision_count/n_eval_episodes*100:.1f}% ({collision_count}/{n_eval_episodes} episodes)")
     print(f"Timeout Rate: {timeout_count/n_eval_episodes*100:.1f}% ({timeout_count}/{n_eval_episodes} episodes)")
-    print(f"\nReward Breakdown (mean ± std):")
-    print(f"Total Reward: {sum(total_rewards)/len(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
-    print(f"Collision Penalty: {sum(collision_penalties)/len(collision_penalties):.2f} ± {np.std(collision_penalties):.2f}")
-    print(f"Episode Length: {sum(episode_lengths)/len(episode_lengths):.1f} ± {np.std(episode_lengths):.1f} steps")
 
 
 if __name__ == "__main__":
