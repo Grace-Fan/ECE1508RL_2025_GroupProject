@@ -89,19 +89,14 @@ def make_env_fn(rank: int, seed: int = 0, render_mode: Optional[str] = None, cur
                 "screen_height": 600,
                 "centering_position": [0.5, 0.6],
                 "scaling": 5.5 * 1.3,
-                # "collision_reward": -5.0,
                 "normalize_reward": False,
                 "offroad_terminal": True,
-                # "arrived_reward": 1.0,
-                # "high_speed_reward": 0,
             }
             env.unwrapped.configure(cfg)
         except Exception as e:
             print("Env Configuration failed:", e)
         # Ensure collision penalty surfaces in scalar reward when missing
         env = CollisionAugmentWrapper(env)
-        # Encourage waiting until intersection is safe before turning
-        # env = SafeTurnRewardWrapper(env, danger_radius=12.0, penalty=-0.2)
         env = Monitor(env)
         try:
             env.reset(seed=seed + rank)
@@ -141,118 +136,6 @@ class CollisionAugmentWrapper(gym.Wrapper):
                 reward = collision_val
         except Exception:
             print("CollisionAugmentWrapper: Exception during step reward adjustment.")
-        return obs, reward, terminated, truncated, info
-
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
-
-
-class SafeTurnRewardWrapper(gym.Wrapper):
-    """Reward shaping wrapper to encourage "wait until safe, then go".
-
-    Adds a small negative reward each step the ego is inside the intersection
-    region and another vehicle is within a given danger radius. This discourages
-    entering or lingering in a busy intersection and encourages waiting until it
-    is actually safe.
-    """
-
-    def __init__(self, env, danger_radius: float = 8.0, penalty: float = -0.1):
-        super().__init__(env)
-        self.danger_radius = danger_radius
-        self.penalty = penalty
-
-        # # Small bonus for waiting safely when blocked by other vehicles
-        # self.safe_wait_bonus = 0.1
-
-        # Intersection region in world coordinates (tune if needed).
-        self.intersection_x_min = -15.0
-        self.intersection_x_max = 15.0
-        self.intersection_y_min = -15.0
-        self.intersection_y_max = 15.0
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        try:
-            # Kinematics observation: (vehicles, features) with
-            # [presence, x, y, vx, vy, cos_h, sin_h]
-            if isinstance(obs, np.ndarray) and obs.ndim == 1:
-                feat_dim = 7
-                vehicles_count = obs.shape[0] // feat_dim
-                obs_2d = obs.reshape(vehicles_count, feat_dim)
-            else:
-                obs_2d = obs
-
-            ego = obs_2d[0]
-            ego_x, ego_y = float(ego[1]), float(ego[2])
-            ego_vx, ego_vy = float(ego[3]), float(ego[4])
-            ego_speed = float(np.hypot(ego_vx, ego_vy))
-
-            # --- Lead-vehicle proximity penalty (rear-end avoidance) ---
-            # Penalize when another vehicle is directly ahead and too close,
-            # regardless of being inside the intersection. This encourages
-            # braking instead of tailgating and reduces rear-end crashes.
-            lead_too_close = False
-            for v in obs_2d[1:]:
-                presence = v[0]
-                if presence <= 0.0:
-                    continue
-                vx, vy = float(v[1]), float(v[2])
-                dx, dy = vx - ego_x, vy - ego_y
-                # Ahead region: in front (dx > 0), near lane center (|dy| small),
-                # and within a short headway distance.
-                if dx > 0.0 and abs(dy) < 3.0 and dx < 6.0:
-                    lead_too_close = True
-                    break
-
-            if lead_too_close:
-                # DiscreteMetaAction mapping: 0=IDLE, 1=FASTER, 2=SLOWER
-                if isinstance(action, (int, np.integer)):
-                    act_val = int(action)
-                elif isinstance(action, (list, np.ndarray)) and len(action) > 0:
-                    act_val = int(action[0])
-                else:
-                    act_val = None
-                    print("SafeTurnRewardWrapper: Unable to interpret action for lead vehicle penalty.")
-
-                if act_val in (0, 1):  # IDLE or FASTER -> penalize
-                    speed_factor = 1.0 + ego_speed / 10.0
-                    scaled_penalty = self.penalty * speed_factor
-                    reward += scaled_penalty
-                    info.setdefault("unsafe_penalties", {})
-                    info["unsafe_penalties"]["lead"] = info["unsafe_penalties"].get("lead", 0.0) + scaled_penalty
-
-                # elif act_val == 2:  # SLOWER -> reward
-                #     reward += self.safe_wait_bonus
-                #     info.setdefault("safe_wait_bonus", 0.0)
-                #     info["safe_wait_bonus"] += self.safe_wait_bonus
-
-            in_intersection = (
-                self.intersection_x_min <= ego_x <= self.intersection_x_max
-                and self.intersection_y_min <= ego_y <= self.intersection_y_max
-            )
-
-            if in_intersection:
-                min_dist = np.inf
-                for v in obs_2d[1:]:
-                    presence = v[0]
-                    if presence <= 0.0:
-                        continue
-                    vx, vy = float(v[1]), float(v[2])
-                    dist = np.hypot(vx - ego_x, vy - ego_y)
-                    if dist < min_dist:
-                        min_dist = dist
-
-                if min_dist < self.danger_radius:
-                    # Scale intersection penalty by speed as well
-                    speed_factor = 1.0 + ego_speed / 10.0
-                    scaled_penalty = self.penalty * speed_factor
-                    reward += scaled_penalty
-                    info.setdefault("unsafe_penalties", {})
-                    info["unsafe_penalties"]["intersection"] = info["unsafe_penalties"].get("intersection", 0.0) + scaled_penalty
-        except Exception:
-            print("SafeTurnRewardWrapper: Exception during step reward adjustment.")
-
         return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):
@@ -310,15 +193,15 @@ class CurriculumCallback(BaseCallback):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-timesteps", type=int, default=200000)
+    parser.add_argument("--total-timesteps", type=int, default=1000000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--save-path", type=str, default="models/ppo_intersection")
+    parser.add_argument("--save-path", type=str, default="models_version2_1m/ppo_intersection")
     parser.add_argument("--tensorboard", action="store_true", help="Enable tensorboard logging")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if available")
     parser.add_argument("--render-mode", type=str, choices=["none", "human", "rgb_array"], default="none", help="Render mode for evaluation (none/human/rgb_array)")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (easy->medium->transit->normal)")
-    parser.add_argument("--curriculum-steps", type=int, default=20000, help="Steps per curriculum level")
+    parser.add_argument("--curriculum-steps", type=int, default=100000, help="Steps per curriculum level")
     args = parser.parse_args()
 
     os.makedirs(args.save_path, exist_ok=True)
