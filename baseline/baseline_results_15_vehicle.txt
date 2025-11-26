@@ -1,0 +1,12 @@
+Rule-based baseline results:
+{
+  "episodes": 100,
+  "success": 46,
+  "collision": 54,
+  "timeout": 0,
+  "mean_reward": 1.1964444381743333,
+  "mean_length": 3.72,
+  "success_rate": 0.46,
+  "collision_rate": 0.54,
+  "timeout_rate": 0.0
+}
