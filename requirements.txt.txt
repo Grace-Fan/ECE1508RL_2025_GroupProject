@@ -1,0 +1,7 @@
+gymnasium==0.29.1
+highway-env==1.8.2
+stable-baselines3==2.3.0
+torch>=2.0
+imageio==2.34.0
+matplotlib==3.9.0
+numpy==1.26.4
